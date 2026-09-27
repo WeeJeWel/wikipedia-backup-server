@@ -55,7 +55,7 @@ independent backups or retention, back up `/data` separately.
 ## Build notes
 
 The image builds on the Pi with Debian packages for `kiwix-serve` and
-`zimcheck` (arm64 and armhf available). No Docker socket, cron daemon, or
+`zimcheck`. No Docker socket, cron daemon, or
 second container is needed. The Python process owns the schedule, progress
 page, download, validation, and Kiwix process. A small HTTP proxy lets the
 progress page and Kiwix use the same public port.
@@ -64,5 +64,6 @@ If you prefer to build locally, run
 `docker build -t wikipedia-backup-server:local .` and change the image in
 `compose.yaml` to `wikipedia-backup-server:local`.
 
-Pushing to `main` runs the tests and publishes `latest` and a commit SHA tag
-to `ghcr.io/weejewel/wikipedia-backup-server` for amd64, arm64, and arm/v7.
+Pushing to `main` runs tests on native amd64 and arm64 runners, builds the
+images separately, and publishes a combined `latest` and commit SHA tag to
+`ghcr.io/weejewel/wikipedia-backup-server`.

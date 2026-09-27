@@ -1,0 +1,15 @@
+services:
+  wikipedia-backup-server:
+    image: ghcr.io/weejewel/wikipedia-backup-server:latest
+    container_name: wikipedia-backup-server
+    restart: unless-stopped
+    environment:
+      LANGUAGE: ${LANGUAGE:-en}
+      SCHEDULE: ${SCHEDULE:-0 3 1 * *}
+      PORT: ${PORT:-8080}
+      TZ: ${TZ:-Europe/Amsterdam}
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - /mnt/nvme1n1p1/Config/Kiwix:/data
+    stop_grace_period: 30s

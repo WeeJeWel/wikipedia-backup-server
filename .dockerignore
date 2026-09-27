@@ -1,0 +1,5 @@
+*.zim
+*.part
+*.pyc
+__pycache__/
+.git/
