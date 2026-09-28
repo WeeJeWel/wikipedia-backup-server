@@ -159,6 +159,27 @@ class Tests(unittest.TestCase):
         self.assertIn("--seed-time=0", args)
         self.assertIn("--rpc-listen-all=false", args)
 
+    def test_torrent_last_bytes_and_piece_check_are_reported(self):
+        total = 52690706555
+        self.app.update_torrent_progress({"totalLength": str(total),
+                                          "completedLength": str(total - 81920),
+                                          "downloadSpeed": "6234"})
+        status = self.app.snapshot()
+        self.assertEqual(status["remaining_bytes"], 81920)
+        self.assertEqual(status["bytes_per_second"], 6234)
+        self.assertEqual(status["phase"], "downloading")
+        self.app.update_torrent_progress({"totalLength": str(total),
+                                          "completedLength": str(total),
+                                          "downloadSpeed": "0",
+                                          "verifiedLength": str(total // 2)})
+        status = self.app.snapshot()
+        self.assertEqual(status["phase"], "checking_pieces")
+        self.assertEqual(status["verified_bytes"], total // 2)
+        self.app.update_torrent_progress({"totalLength": str(total),
+                                          "completedLength": str(total),
+                                          "downloadSpeed": "0"})
+        self.assertEqual(self.app.snapshot()["phase"], "finishing")
+
     def test_first_visit_shows_progress_and_status(self):
         ui = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         ui.app = self.app

@@ -184,7 +184,7 @@ class App:
         self.run_check = threading.Event()
         self.status = dict(phase="starting", filename=None, active_filename=None,
                            downloaded=0, total=None, started_at=None, started_bytes=0,
-                           download_speed=None, error=None)
+                           download_speed=None, verified_bytes=None, error=None)
 
     def update_status(self, **changes):
         with self.lock:
@@ -205,7 +205,19 @@ class App:
         result.pop("started_at", None)
         result.pop("started_bytes", None)
         result.pop("download_speed", None)
+        if result["total"] is not None:
+            result["remaining_bytes"] = max(0, result["total"] - result["downloaded"])
         return result
+
+    def update_torrent_progress(self, item):
+        total = int(item["totalLength"])
+        completed = int(item["completedLength"])
+        verified = item.get("verifiedLength")
+        phase = ("checking_pieces" if verified is not None else
+                 "finishing" if completed >= total else "downloading")
+        self.update_status(phase=phase, downloaded=completed, total=total,
+                           verified_bytes=int(verified) if verified is not None else None,
+                           download_speed=int(item["downloadSpeed"]))
 
     def latest(self) -> str:
         with urllib.request.urlopen(INDEX_URL, timeout=45) as response:
@@ -379,7 +391,8 @@ class App:
         if shutil.disk_usage(self.data).free < expected - allocated + 1024 ** 3:
             raise RuntimeError("not enough free space for new ZIM plus 1 GiB reserve")
         self.update_status(phase="downloading", filename=name, downloaded=0,
-                           total=expected, started_at=None, download_speed=0, error=None)
+                           total=expected, started_at=None, download_speed=0,
+                           verified_bytes=None, error=None)
 
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -393,6 +406,8 @@ class App:
                 "--console-log-level=warn", "--summary-interval=0", str(torrent)]
         LOG.info("Downloading %s via BitTorrent and its web seed", name)
         proc = subprocess.Popen(args)
+        last_progress = time.monotonic()
+        last_completed = 0
         try:
             while proc.poll() is None and not self.stop.wait(2):
                 request = urllib.request.Request(
@@ -400,16 +415,25 @@ class App:
                     data=json.dumps({"jsonrpc": "2.0", "id": "progress",
                                      "method": "aria2.tellActive",
                                      "params": ["token:" + secret,
-                                                ["totalLength", "completedLength", "downloadSpeed"]]}).encode(),
+                                                ["totalLength", "completedLength", "downloadSpeed",
+                                                 "verifiedLength"]]}).encode(),
                     headers={"Content-Type": "application/json"}, method="POST")
                 try:
                     with urllib.request.urlopen(request, timeout=2) as response:
                         active = json.load(response).get("result", [])
                     if active:
                         item = active[0]
-                        self.update_status(downloaded=int(item["completedLength"]),
-                                           total=int(item["totalLength"]),
-                                           download_speed=int(item["downloadSpeed"]))
+                        self.update_torrent_progress(item)
+                        completed = int(item["completedLength"])
+                        if item.get("verifiedLength") is not None:
+                            # A full integrity scan may take hours on a Pi.
+                            last_progress = time.monotonic()
+                        elif completed != last_completed:
+                            last_completed = completed
+                            last_progress = time.monotonic()
+                        elif completed < expected and time.monotonic() - last_progress > 900:
+                            raise RuntimeError("torrent made no byte progress for 15 minutes; "
+                                               "retrying with the staged file")
                 except (OSError, ValueError, KeyError):
                     # The local RPC socket might not yet be listening, or the
                     # process may have exited between polling and the request.
@@ -517,13 +541,19 @@ function size(n){if(n==null)return 'unknown'; let u=['B','KiB','MiB','GiB','TiB'
 while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]}
 async function refresh(){try{let r=await fetch('/status',{cache:'no-store'}),s=await r.json();
 let msg={starting:'Starting',checking:'Checking for an archive',downloading:'Downloading',
+checking_pieces:'Checking torrent pieces',finishing:'Finishing torrent',
 verifying:'Verifying archive checksum',ready:'Wikipedia is ready',error:'Update needs attention'};
 document.getElementById('phase').textContent=(msg[s.phase]||s.phase)+(s.filename?' — '+s.filename:'');
 let bar=document.getElementById('bar');bar.removeAttribute('value');
-if(s.phase==='downloading'&&s.total){bar.max=s.total;bar.value=s.downloaded}
-document.getElementById('detail').textContent=s.phase==='downloading'?
-size(s.downloaded)+' / '+size(s.total)+(s.total?' ('+(100*s.downloaded/s.total).toFixed(1)+'%)':'')+
+let checking=s.phase==='checking_pieces', downloading=s.phase==='downloading';
+let count=checking?s.verified_bytes:s.downloaded;
+if((downloading||checking||s.phase==='finishing')&&s.total&&count!=null){bar.max=s.total;bar.value=count}
+let pct=s.total&&count!=null?Math.min(count<s.total?99.99:100,100*count/s.total).toFixed(2)+'%':'';
+document.getElementById('detail').textContent=downloading?
+size(s.downloaded)+' / '+size(s.total)+' ('+pct+') · '+size(s.remaining_bytes)+' remaining'+
 (s.bytes_per_second?' · '+size(s.bytes_per_second)+'/s':''):
+checking?size(s.verified_bytes)+' / '+size(s.total)+' checked ('+pct+')':
+s.phase==='finishing'?size(s.total)+' received; waiting for torrent to finish':
 (s.serving?'Currently serving '+s.active_filename:'Waiting for the archive to be ready');
 document.getElementById('error').textContent=s.error||'';
 if(s.serving&&initiallyWaiting){location.replace('/');return}

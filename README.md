@@ -57,6 +57,14 @@ before it is served. During an update the old version stays available. The
 old file is deleted only after the replacement web server responds. If the
 replacement fails to start, the old version is restored.
 
+The progress page shows exact remaining bytes near completion and distinguishes
+the torrent's piece check from the final ZIM checksum check. If a torrent makes
+no byte progress for 15 minutes while downloading, aria2 is restarted on the
+next retry without deleting its staged file. To inspect a stalled transfer,
+compare `/status` a few minutes apart and run
+`docker compose logs --tail=100 wikipedia-backup-server`. A container restart
+also retains the staged file and resumes its verified pieces.
+
 Do not expose this unauthenticated server to the public Internet without an
 appropriate access layer. The archive is periodically replaced; if you need
 independent backups or retention, back up `/data` separately.
