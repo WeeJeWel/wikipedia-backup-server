@@ -22,9 +22,11 @@ docker compose up -d
 docker compose logs -f wikipedia-backup-server
 ```
 
-Visit `http://<pi-ip>:8080/`. The first download starts automatically. If a
-matching `.zim` is already in the mounted directory, it is verified and served;
-no manual initial download is required. `/progress` always displays status,
+Visit `http://<pi-ip>:8080/`. The first download starts automatically. When
+ready, the root address opens the Wikipedia archive directly. If a matching
+`.zim` is already in the mounted directory, it is verified and served;
+no manual initial download is required. `/progress` always displays status
+and links back to Wikipedia,
 and `/status` returns JSON. The first full download is about 49 GB for English.
 Allow space for both the current and replacement ZIM during an update.
 

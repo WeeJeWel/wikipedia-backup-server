@@ -556,7 +556,8 @@ progress{width:100%;height:1.4rem;accent-color:#2563eb}small{color:#56616d}
 code{background:#edf2f7;padding:.15rem .3rem;border-radius:4px}
 </style></head><body><main><h1>Wikipedia backup server</h1>
 <p id="phase">Starting…</p><progress id="bar"></progress>
-<p id="detail"></p><p id="error" role="alert"></p>
+<p id="detail"></p><p id="open" hidden><a href="/">Open Wikipedia →</a></p>
+<p id="error" role="alert"></p>
 <small>Updates appear automatically. <a href="/progress">Progress</a> · <a href="/status">JSON status</a></small>
 </main><script>
 let initiallyWaiting = location.pathname !== '/progress';
@@ -579,6 +580,7 @@ checking?size(s.verified_bytes)+' / '+size(s.total)+' checked ('+pct+')':
 s.phase==='finishing'?size(s.total)+' received; waiting for torrent to finish':
 (s.serving?'Currently serving '+s.active_filename:'Waiting for the archive to be ready');
 document.getElementById('error').textContent=s.error||'';
+document.getElementById('open').hidden=!s.serving;
 if(s.serving&&initiallyWaiting){location.replace('/');return}
 }catch(e){document.getElementById('error').textContent='Cannot fetch status: '+e}}
 refresh();setInterval(refresh,2000);
@@ -618,8 +620,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, PAGE, "text/html; charset=utf-8")
         with self.app.lock:
             ready = self.app.process is not None and self.app.process.poll() is None
+            current = self.app.current
         if not ready:
             return self.respond(200, PAGE, "text/html; charset=utf-8")
+        if path == "/" and self.command in ("GET", "HEAD") and current:
+            self.send_response(302)
+            self.send_header("Location", "/content/" + current.stem)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         self.proxy()
 
     def proxy(self):

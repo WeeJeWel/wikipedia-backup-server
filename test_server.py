@@ -279,7 +279,14 @@ class Tests(unittest.TestCase):
         conn.close()
         conn = http.client.HTTPConnection("127.0.0.1", ui.server_port)
         conn.request("GET", "/progress")
-        self.assertIn(b"Wikipedia backup server", conn.getresponse().read())
+        page = conn.getresponse().read()
+        self.assertIn(b"Wikipedia backup server", page)
+        self.assertIn(b"Open Wikipedia", page)
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.getheader("Location"), "/content/" + Path(NAME).stem)
+        response.read()
         conn.close()
 
     def test_old_archive_removed_only_after_new_server_ready(self):
