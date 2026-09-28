@@ -160,6 +160,19 @@ def torrent_info(payload: bytes) -> tuple[str, int]:
     return name.decode("utf-8"), length
 
 
+def aria2_rpc(port: int, secret: str, method: str, *params):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/jsonrpc",
+        data=json.dumps({"jsonrpc": "2.0", "id": "progress", "method": method,
+                         "params": ["token:" + secret, *params]}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=2) as response:
+        answer = json.load(response)
+    if "error" in answer:
+        raise RuntimeError(f"aria2 RPC {method}: {answer['error']}")
+    return answer["result"]
+
+
 class App:
     def __init__(self, data: Path, language: str, schedule: str, port: int, tz: str,
                  download_method: str = "torrent"):
@@ -400,6 +413,7 @@ class App:
         secret = secrets.token_hex(24)
         args = ["aria2c", f"--dir={incoming}", "--check-integrity=true",
                 "--continue=true", "--file-allocation=none", "--seed-time=0",
+                "--bt-hash-check-seed=false",
                 "--bt-stop-timeout=900", "--split=8", "--max-connection-per-server=8",
                 "--enable-rpc=true", "--rpc-listen-all=false",
                 f"--rpc-listen-port={rpc_port}", f"--rpc-secret={secret}",
@@ -408,23 +422,20 @@ class App:
         proc = subprocess.Popen(args)
         last_progress = time.monotonic()
         last_completed = 0
+        confirmed_complete = False
         try:
             while proc.poll() is None and not self.stop.wait(2):
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{rpc_port}/jsonrpc",
-                    data=json.dumps({"jsonrpc": "2.0", "id": "progress",
-                                     "method": "aria2.tellActive",
-                                     "params": ["token:" + secret,
-                                                ["totalLength", "completedLength", "downloadSpeed",
-                                                 "verifiedLength"]]}).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST")
                 try:
-                    with urllib.request.urlopen(request, timeout=2) as response:
-                        active = json.load(response).get("result", [])
+                    active = aria2_rpc(rpc_port, secret, "aria2.tellActive",
+                                       ["totalLength", "completedLength", "downloadSpeed",
+                                        "verifiedLength", "seeder"])
                     if active:
                         item = active[0]
                         self.update_torrent_progress(item)
                         completed = int(item["completedLength"])
+                        if (completed == expected and item.get("seeder") == "true"
+                                and item.get("verifiedLength") is None):
+                            confirmed_complete = True
                         if item.get("verifiedLength") is not None:
                             # A full integrity scan may take hours on a Pi.
                             last_progress = time.monotonic()
@@ -434,6 +445,18 @@ class App:
                         elif completed < expected and time.monotonic() - last_progress > 900:
                             raise RuntimeError("torrent made no byte progress for 15 minutes; "
                                                "retrying with the staged file")
+                    else:
+                        stopped = aria2_rpc(rpc_port, secret, "aria2.tellStopped", 0, 1,
+                                            ["status", "errorCode", "errorMessage"])
+                        if stopped and stopped[0]["status"] == "complete":
+                            confirmed_complete = True
+                        elif stopped and stopped[0]["status"] == "error":
+                            raise RuntimeError("torrent failed: " +
+                                               stopped[0].get("errorMessage", "unknown aria2 error"))
+                    if confirmed_complete:
+                        LOG.info("Torrent finished; shutting down aria2 to verify the ZIM")
+                        aria2_rpc(rpc_port, secret, "aria2.shutdown")
+                        break
                 except (OSError, ValueError, KeyError):
                     # The local RPC socket might not yet be listening, or the
                     # process may have exited between polling and the request.
@@ -448,7 +471,7 @@ class App:
             raise
         if self.stop.is_set():
             raise RuntimeError("torrent download interrupted by shutdown")
-        if code != 0 or not stage.exists() or stage.stat().st_size != expected:
+        if (code != 0 and not confirmed_complete) or not stage.exists() or stage.stat().st_size != expected:
             raise RuntimeError(f"torrent download failed (aria2 exit {code}); staging file retained")
         self.update_status(downloaded=expected, download_speed=0)
         return stage

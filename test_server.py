@@ -157,7 +157,55 @@ class Tests(unittest.TestCase):
         args = launched.call_args.args[0]
         self.assertIn("--check-integrity=true", args)
         self.assertIn("--seed-time=0", args)
+        self.assertIn("--bt-hash-check-seed=false", args)
         self.assertIn("--rpc-listen-all=false", args)
+
+    def test_completed_torrent_rpc_shuts_down_and_returns_stage(self):
+        stage = self.app.data / ".incoming" / NAME
+
+        class RpcProcess:
+            done = False
+
+            def __init__(self, _args):
+                stage.write_bytes(CONTENT)
+
+            def poll(self):
+                return 0 if self.done else None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                self.done = True
+
+        process = None
+        methods = []
+
+        def urlopen(request, timeout=None):
+            if isinstance(request, str):
+                return io.BytesIO(fake_torrent())
+            method = json.loads(request.data)["method"]
+            methods.append(method)
+            if method == "aria2.tellActive":
+                result = []
+            elif method == "aria2.tellStopped":
+                result = [{"status": "complete"}]
+            else:
+                process.done = True
+                result = "OK"
+            return io.BytesIO(json.dumps({"result": result}).encode())
+
+        with mock.patch.object(server.subprocess, "Popen", side_effect=lambda args: RpcProcess(args)) as popen, \
+             mock.patch.object(server.urllib.request, "urlopen", side_effect=urlopen), \
+             mock.patch.object(self.app.stop, "wait", return_value=False):
+            # Capture the process from Popen so the fake RPC can shut it down.
+            def launch(args):
+                nonlocal process
+                process = RpcProcess(args)
+                return process
+            popen.side_effect = launch
+            self.assertEqual(self.app.download_torrent(NAME), stage)
+        self.assertEqual(methods, ["aria2.tellActive", "aria2.tellStopped", "aria2.shutdown"])
 
     def test_torrent_last_bytes_and_piece_check_are_reported(self):
         total = 52690706555

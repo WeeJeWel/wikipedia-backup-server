@@ -63,7 +63,10 @@ no byte progress for 15 minutes while downloading, aria2 is restarted on the
 next retry without deleting its staged file. To inspect a stalled transfer,
 compare `/status` a few minutes apart and run
 `docker compose logs --tail=100 wikipedia-backup-server`. A container restart
-also retains the staged file and resumes its verified pieces.
+also retains the staged file and resumes its verified pieces. Once aria2 reports
+the torrent complete, the supervisor shuts down its RPC process and checks the
+ZIM checksum before serving it; the RPC process does not need to exit on its
+own.
 
 Do not expose this unauthenticated server to the public Internet without an
 appropriate access layer. The archive is periodically replaced; if you need
