@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -117,18 +119,63 @@ def matching_files(data: Path, language: str) -> list[Path]:
     return sorted((p for p in data.iterdir() if p.is_file() and pattern.fullmatch(p.name)), reverse=True)
 
 
+def torrent_info(payload: bytes) -> tuple[str, int]:
+    """Read only the identity/size needed to validate a single-file torrent."""
+    def item(pos: int, depth: int = 0):
+        if depth > 12 or pos >= len(payload):
+            raise ValueError("invalid torrent metadata")
+        marker = payload[pos:pos + 1]
+        if marker == b"i":
+            end = payload.index(b"e", pos)
+            return int(payload[pos + 1:end]), end + 1
+        if marker in (b"l", b"d"):
+            values = []
+            pos += 1
+            while pos < len(payload) and payload[pos:pos + 1] != b"e":
+                value, pos = item(pos, depth + 1)
+                values.append(value)
+            if pos >= len(payload):
+                raise ValueError("unterminated torrent metadata")
+            if marker == b"l":
+                return values, pos + 1
+            if len(values) % 2 or any(not isinstance(k, bytes) for k in values[::2]):
+                raise ValueError("invalid torrent dictionary")
+            return dict(zip(values[::2], values[1::2])), pos + 1
+        colon = payload.index(b":", pos)
+        size = int(payload[pos:colon])
+        end = colon + 1 + size
+        if size < 0 or end > len(payload):
+            raise ValueError("invalid torrent string")
+        return payload[colon + 1:end], end
+
+    metadata, end = item(0)
+    if end != len(payload) or not isinstance(metadata, dict):
+        raise ValueError("invalid torrent file")
+    info = metadata.get(b"info")
+    if not isinstance(info, dict) or b"files" in info:
+        raise ValueError("expected a single-file torrent")
+    name, length = info.get(b"name"), info.get(b"length")
+    if not isinstance(name, bytes) or not isinstance(length, int) or length < 1024:
+        raise ValueError("torrent has no valid name or length")
+    return name.decode("utf-8"), length
+
+
 class App:
-    def __init__(self, data: Path, language: str, schedule: str, port: int, tz: str):
+    def __init__(self, data: Path, language: str, schedule: str, port: int, tz: str,
+                 download_method: str = "torrent"):
         if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2,8})?", language):
             raise ValueError("LANGUAGE must be a Wikipedia language code, such as en or pt")
         if not 1 <= port <= 65535 or port == BACKEND_PORT:
             raise ValueError("PORT must be between 1 and 65535 and differ from the internal port")
+        if download_method not in ("torrent", "http"):
+            raise ValueError("DOWNLOAD_METHOD must be torrent or http")
         self.data = data
         self.data.mkdir(parents=True, exist_ok=True)
         self.language = language
         self.schedule = Schedule(schedule)
         self.tz = ZoneInfo(tz)
         self.port = port
+        self.download_method = download_method
         self.current: Path | None = None
         self.process: subprocess.Popen | None = None
         self.lock = threading.RLock()
@@ -136,7 +183,8 @@ class App:
         self.stop = threading.Event()
         self.run_check = threading.Event()
         self.status = dict(phase="starting", filename=None, active_filename=None,
-                           downloaded=0, total=None, started_at=None, error=None)
+                           downloaded=0, total=None, started_at=None, started_bytes=0,
+                           download_speed=None, error=None)
 
     def update_status(self, **changes):
         with self.lock:
@@ -147,12 +195,16 @@ class App:
             result = self.status.copy()
             result["active_filename"] = self.current.name if self.current else None
             result["serving"] = self.process is not None and self.process.poll() is None
-        if result["started_at"] and result["phase"] == "downloading":
+        if result["download_speed"] is not None and result["phase"] == "downloading":
+            result["bytes_per_second"] = result["download_speed"]
+        elif result["started_at"] and result["phase"] == "downloading":
             elapsed = max(time.monotonic() - result["started_at"], 0.001)
-            result["bytes_per_second"] = result["downloaded"] / elapsed
+            result["bytes_per_second"] = max(0, result["downloaded"] - result["started_bytes"]) / elapsed
         else:
             result["bytes_per_second"] = None
         result.pop("started_at", None)
+        result.pop("started_bytes", None)
+        result.pop("download_speed", None)
         return result
 
     def latest(self) -> str:
@@ -223,7 +275,7 @@ class App:
         with self.lock:
             self.process, self.current = proc, path
         self.update_status(phase="ready", filename=path.name, downloaded=0,
-                           total=None, started_at=None, error=None)
+                           total=None, started_at=None, download_speed=None, error=None)
         if old and old != path:
             try:
                 old.unlink()
@@ -258,7 +310,8 @@ class App:
             raise RuntimeError("not enough free space for new ZIM plus 1 GiB reserve")
 
         self.update_status(phase="downloading", filename=name, downloaded=existing,
-                           total=expected, started_at=time.monotonic(), error=None)
+                           total=expected, started_at=time.monotonic(),
+                           started_bytes=existing, download_speed=None, error=None)
         if existing == expected:
             return partial
 
@@ -276,7 +329,7 @@ class App:
             elif response.status == 200:
                 mode = "wb"
                 existing = 0
-                self.update_status(downloaded=0, started_at=time.monotonic())
+                self.update_status(downloaded=0, started_at=time.monotonic(), started_bytes=0)
             else:
                 raise RuntimeError(f"unexpected download response: HTTP {response.status}")
             last_report = 0.0
@@ -299,6 +352,82 @@ class App:
         if existing != expected:
             raise RuntimeError(f"incomplete download: {existing} of {expected} bytes")
         return partial
+
+    def download_torrent(self, name: str) -> Path:
+        incoming = self.data / ".incoming"
+        incoming.mkdir(exist_ok=True)
+        torrent = incoming / (name + ".torrent")
+        stage = incoming / name
+        with urllib.request.urlopen(INDEX_URL + name + ".torrent", timeout=60) as response:
+            payload = response.read(4 * 1024 * 1024 + 1)
+        if len(payload) > 4 * 1024 * 1024:
+            raise RuntimeError("torrent metadata is unexpectedly large")
+        torrent_name, expected = torrent_info(payload)
+        if torrent_name != name:
+            raise RuntimeError("torrent filename does not match the selected ZIM")
+        torrent.write_bytes(payload)
+
+        # Reuse the former HTTP downloader's contiguous partial file. aria2
+        # checks every torrent piece before accepting any of its bytes.
+        old_partial = self.data / (name + ".part")
+        if not stage.exists() and old_partial.exists() and old_partial.stat().st_size <= expected:
+            old_partial.replace(stage)
+            (self.data / (name + ".part.json")).unlink(missing_ok=True)
+            LOG.info("Migrated HTTP partial to torrent staging: %s", name)
+
+        allocated = stage.stat().st_blocks * 512 if stage.exists() else 0
+        if shutil.disk_usage(self.data).free < expected - allocated + 1024 ** 3:
+            raise RuntimeError("not enough free space for new ZIM plus 1 GiB reserve")
+        self.update_status(phase="downloading", filename=name, downloaded=0,
+                           total=expected, started_at=None, download_speed=0, error=None)
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            rpc_port = sock.getsockname()[1]
+        secret = secrets.token_hex(24)
+        args = ["aria2c", f"--dir={incoming}", "--check-integrity=true",
+                "--continue=true", "--file-allocation=none", "--seed-time=0",
+                "--bt-stop-timeout=900", "--split=8", "--max-connection-per-server=8",
+                "--enable-rpc=true", "--rpc-listen-all=false",
+                f"--rpc-listen-port={rpc_port}", f"--rpc-secret={secret}",
+                "--console-log-level=warn", "--summary-interval=0", str(torrent)]
+        LOG.info("Downloading %s via BitTorrent and its web seed", name)
+        proc = subprocess.Popen(args)
+        try:
+            while proc.poll() is None and not self.stop.wait(2):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{rpc_port}/jsonrpc",
+                    data=json.dumps({"jsonrpc": "2.0", "id": "progress",
+                                     "method": "aria2.tellActive",
+                                     "params": ["token:" + secret,
+                                                ["totalLength", "completedLength", "downloadSpeed"]]}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(request, timeout=2) as response:
+                        active = json.load(response).get("result", [])
+                    if active:
+                        item = active[0]
+                        self.update_status(downloaded=int(item["completedLength"]),
+                                           total=int(item["totalLength"]),
+                                           download_speed=int(item["downloadSpeed"]))
+                except (OSError, ValueError, KeyError):
+                    # The local RPC socket might not yet be listening, or the
+                    # process may have exited between polling and the request.
+                    pass
+            if self.stop.is_set() and proc.poll() is None:
+                proc.terminate()
+            code = proc.wait(timeout=30)
+        except Exception:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=30)
+            raise
+        if self.stop.is_set():
+            raise RuntimeError("torrent download interrupted by shutdown")
+        if code != 0 or not stage.exists() or stage.stat().st_size != expected:
+            raise RuntimeError(f"torrent download failed (aria2 exit {code}); staging file retained")
+        self.update_status(downloaded=expected, download_speed=0)
+        return stage
 
     def check_once(self):
         with self.operation_lock:
@@ -329,15 +458,19 @@ class App:
                     target.rename(invalid)
                     LOG.exception("Moved invalid archive to %s", invalid.name)
             if not target.exists():
-                partial = self.download(name)
+                partial = (self.download_torrent(name) if self.download_method == "torrent"
+                           else self.download(name))
                 try:
                     self.verify(partial)
                 except Exception:
                     partial.unlink(missing_ok=True)
+                    (self.data / ".incoming" / (name + ".aria2")).unlink(missing_ok=True)
                     (self.data / (name + ".part.json")).unlink(missing_ok=True)
                     raise
                 os.replace(partial, target)
                 (self.data / (name + ".part.json")).unlink(missing_ok=True)
+                (self.data / ".incoming" / (name + ".torrent")).unlink(missing_ok=True)
+                (self.data / ".incoming" / (name + ".aria2")).unlink(missing_ok=True)
             self.activate(target)
 
     def worker(self):
@@ -477,7 +610,8 @@ def main():
     app = App(DATA, os.environ.get("LANGUAGE", "en").lower(),
               os.environ.get("SCHEDULE", "0 3 1 * *"),
               int(os.environ.get("PORT", "8080")),
-              os.environ.get("TZ", "Europe/Amsterdam"))
+              os.environ.get("TZ", "Europe/Amsterdam"),
+              os.environ.get("DOWNLOAD_METHOD", "torrent").lower())
     server = ThreadingHTTPServer(("0.0.0.0", app.port), Handler)
     server.app = app
     def shutdown(_signum, _frame):

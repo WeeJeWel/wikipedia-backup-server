@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import tempfile
 import threading
@@ -14,6 +15,23 @@ import server
 
 NAME = "wikipedia_en_all_nopic_2026-06.zim"
 CONTENT = b"test-zim-content" * 256
+
+
+def bencode(value):
+    if isinstance(value, int):
+        return b"i" + str(value).encode() + b"e"
+    if isinstance(value, bytes):
+        return str(len(value)).encode() + b":" + value
+    if isinstance(value, list):
+        return b"l" + b"".join(bencode(item) for item in value) + b"e"
+    if isinstance(value, dict):
+        return b"d" + b"".join(bencode(k) + bencode(v) for k, v in sorted(value.items())) + b"e"
+    raise TypeError(value)
+
+
+def fake_torrent(name=NAME, length=len(CONTENT)):
+    return bencode({b"info": {b"name": name.encode(), b"length": length,
+                               b"piece length": 4096, b"pieces": b"0" * 20}})
 
 
 class Catalog(BaseHTTPRequestHandler):
@@ -110,6 +128,37 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.app.download(NAME).read_bytes(), CONTENT)
         self.assertEqual(Catalog.transferred, [100])
 
+    def test_torrent_metadata_and_http_partial_migration(self):
+        self.assertEqual(server.torrent_info(fake_torrent()), (NAME, len(CONTENT)))
+        with self.assertRaisesRegex(ValueError, "single-file"):
+            server.torrent_info(bencode({b"info": {b"name": b"bad", b"files": []}}))
+        partial = self.app.data / (NAME + ".part")
+        partial.write_bytes(CONTENT[:100])
+
+        class FinishedProcess:
+            def __init__(self, args):
+                self.args = args
+                stage = self_outer.app.data / ".incoming" / NAME
+                self_outer.assertEqual(stage.read_bytes(), CONTENT[:100])
+                stage.write_bytes(CONTENT)
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        self_outer = self
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=io.BytesIO(fake_torrent())), \
+             mock.patch.object(server.subprocess, "Popen", side_effect=FinishedProcess) as launched:
+            stage = self.app.download_torrent(NAME)
+        self.assertFalse(partial.exists())
+        self.assertEqual(stage.read_bytes(), CONTENT)
+        args = launched.call_args.args[0]
+        self.assertIn("--check-integrity=true", args)
+        self.assertIn("--seed-time=0", args)
+        self.assertIn("--rpc-listen-all=false", args)
+
     def test_first_visit_shows_progress_and_status(self):
         ui = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         ui.app = self.app
@@ -131,7 +180,7 @@ class Tests(unittest.TestCase):
         old.write_bytes(b"old")
         self.app.current = old
         self.app.process = FakeProcess()
-        with mock.patch.object(self.app, "download", side_effect=RuntimeError("no space")):
+        with mock.patch.object(self.app, "download_torrent", side_effect=RuntimeError("no space")):
             with self.assertRaisesRegex(RuntimeError, "no space"):
                 self.app.check_once()
         self.assertIs(self.app.current, old)
