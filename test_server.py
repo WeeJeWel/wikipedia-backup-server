@@ -285,7 +285,7 @@ class Tests(unittest.TestCase):
         conn.request("GET", "/")
         response = conn.getresponse()
         self.assertEqual(response.status, 302)
-        self.assertEqual(response.getheader("Location"), "/content/" + Path(NAME).stem)
+        self.assertEqual(response.getheader("Location"), "/viewer#" + Path(NAME).stem + "/")
         response.read()
         conn.close()
 

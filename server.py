@@ -625,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, PAGE, "text/html; charset=utf-8")
         if path == "/" and self.command in ("GET", "HEAD") and current:
             self.send_response(302)
-            self.send_header("Location", "/content/" + current.stem)
+            self.send_header("Location", "/viewer#" + current.stem + "/")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
